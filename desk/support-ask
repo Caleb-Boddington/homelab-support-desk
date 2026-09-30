@@ -1,0 +1,9 @@
+#!/bin/sh
+# CT 111: /usr/local/bin/support-ask.
+#
+# The only command the triage and reports Claude may run. It used to be allowed `ssh support ...`
+# directly, but OpenSSH reads options written AFTER the host name, so `ssh support -o
+# ProxyCommand=...` would have run anything as root in this container without ever reaching the
+# gate (security review, 28/09/2026). Here the host is fixed, the config file is fixed, and `--`
+# ends option parsing, so everything Claude types becomes the request the gate reads.
+exec ssh -F /etc/support-desk/ssh_config -- support "$@"

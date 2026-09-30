@@ -1,0 +1,6 @@
+[Unit]
+Description=Support desk: host disk and mount checks
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/support-watch.sh

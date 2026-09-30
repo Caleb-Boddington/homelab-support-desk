@@ -1,0 +1,12 @@
+# CT 111: /etc/support-desk/ssh_config.
+# Read only by support-ask (ssh -F), so nothing in /root/.ssh/config can change what it does.
+Host support
+  HostName <your-proxmox-host-ip>
+  User root
+  IdentityFile /root/.ssh/id_support
+  IdentitiesOnly yes
+  BatchMode yes
+  ProxyCommand none
+  PermitLocalCommand no
+  ForwardAgent no
+  ClearAllForwardings yes

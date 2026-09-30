@@ -1,0 +1,90 @@
+#!/bin/bash
+# Proxmox host: /usr/local/sbin/support-gate.
+#
+# The support desk's only way in. CT 111's support key is pinned to this script in the host's
+# authorized_keys (command="...",restrict), so whatever that key asks to run, the host runs
+# THIS instead and reads the request from $SSH_ORIGINAL_COMMAND. Anything not on the menu below
+# is refused. The menu is read-only checks plus the easy fixes the owner approved on 23/09/2026:
+# restart a crashed container, app or service. Nothing on it deletes or reconfigures.
+# Widening it needs the owner's say-so for that specific addition.
+set -uo pipefail
+LOG=/var/log/support-desk.log
+log() { echo "$(date '+%F %T')  $*" >> "$LOG"; }
+
+read -r -a A <<< "${SSH_ORIGINAL_COMMAND:-help}"
+CMD=${A[0]:-help}; X=${A[1]:-}; Y=${A[2]:-}
+
+ct_ok()   { [[ $1 =~ ^[0-9]{3}$ ]] && pct status "$1" >/dev/null 2>&1; }
+vm_ok()   { [[ $1 =~ ^[0-9]{3}$ ]] && qm status "$1" >/dev/null 2>&1; }
+name_ok() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$ ]]; }
+refuse()  { echo "REFUSED: $*"; log "refused: ${SSH_ORIGINAL_COMMAND:-}"; exit 2; }
+
+case "$CMD" in
+help)
+  cat <<'EOF'
+Read-only:
+  facts                    host health summary: disks, storage, guests, failed services, backups
+  guests                   list containers and VMs with their state
+  ct-status ID             one container: state, failed services, Docker apps
+  vm-status ID             one VM: state
+  logs ID [APP]            recent warnings in a container, or one app's log (Docker or service)
+  host-logs                host warnings from the last 3 hours
+Easy fixes (logged):
+  restart-ct ID            restart a container (not 111, where the desk itself runs)
+  restart-app ID NAME      restart one Docker app inside a container
+  restart-service ID UNIT  restart one service inside a container
+EOF
+  ;;
+facts)
+  echo "== time";      date '+%F %T %Z'; uptime
+  echo "== memory";    free -h | sed -n 1,2p
+  echo "== disks";     df -h / /mnt/hub /mnt/media /mnt/backup 2>&1
+  echo "== thin pools"; lvs --noheadings -o lv_name,vg_name,data_percent,metadata_percent 2>/dev/null | awk '$3!=""'
+  echo "== guests";    pct list; qm list
+  echo "== failed services on host"; systemctl --failed --no-legend --no-pager || true
+  echo "== disk health"
+  for d in /dev/sd? /dev/nvme?n1; do [ -e "$d" ] && echo "$d: $(smartctl -H "$d" 2>/dev/null | grep -iE 'overall-health|SMART Health Status' | sed 's/.*: *//')"; done
+  echo "== nightly backup (restic), last entries"; tail -n 8 /var/log/backup.log 2>/dev/null
+  echo "== samba"; systemctl is-active smbd
+  ;;
+guests)
+  pct list; qm list ;;
+ct-status)
+  ct_ok "$X" || refuse "no such container: $X"
+  pct status "$X"
+  pct exec "$X" -- sh -c 'echo "== failed services"; systemctl --failed --no-legend --no-pager 2>/dev/null;
+    command -v docker >/dev/null && { echo "== docker apps"; docker ps -a --format "{{.Names}}\t{{.Status}}"; }; true'
+  ;;
+vm-status)
+  vm_ok "$X" || refuse "no such VM: $X"
+  qm status "$X" --verbose | grep -E '^(status|qmpstatus|uptime|name):' ;;
+logs)
+  ct_ok "$X" || refuse "no such container: $X"
+  if [ -n "$Y" ]; then
+    name_ok "$Y" || refuse "bad app name"
+    pct exec "$X" -- sh -c "docker logs --tail 80 '$Y' 2>&1 || journalctl -u '$Y' -n 80 --no-pager 2>&1" | tail -n 120
+  else
+    pct exec "$X" -- journalctl -p warning -n 60 --no-pager 2>&1 | tail -n 60
+  fi ;;
+host-logs)
+  journalctl -p warning -S -3h -n 100 --no-pager ;;
+restart-ct)
+  ct_ok "$X" || refuse "no such container: $X"
+  [ "$X" = 111 ] && refuse "111 is where the support desk runs"
+  log "restart-ct $X"; pct reboot "$X" && sleep 20; pct status "$X" ;;
+restart-app)
+  ct_ok "$X" || refuse "no such container: $X"; name_ok "$Y" || refuse "bad app name"
+  [ "$X" = 111 ] && refuse "111 is where the support desk runs"
+  log "restart-app $X $Y"; pct exec "$X" -- docker restart "$Y" && sleep 15
+  pct exec "$X" -- docker ps -a --filter "name=^${Y}$" --format '{{.Names}}\t{{.Status}}' ;;
+restart-service)
+  ct_ok "$X" || refuse "no such container: $X"; name_ok "$Y" || refuse "bad service name"
+  [ "$X" = 111 ] && refuse "111 is where the support desk runs"
+  # Only real services. Without this, poweroff.target or reboot.target would switch the
+  # container off rather than restart anything (security review, 28/09/2026).
+  case "$Y" in *.service) ;; *.*) refuse "services only, not $Y" ;; *) Y="$Y.service" ;; esac
+  log "restart-service $X $Y"; pct exec "$X" -- systemctl restart "$Y" && sleep 10
+  pct exec "$X" -- systemctl is-active "$Y" ;;
+*)
+  refuse "not on the menu: $CMD (run help)" ;;
+esac

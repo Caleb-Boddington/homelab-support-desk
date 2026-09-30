@@ -1,0 +1,9 @@
+[Unit]
+Description=Support desk: host checks every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

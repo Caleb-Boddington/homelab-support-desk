@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+# CT 111: /usr/local/bin/support-triage EVENT.json.
+#
+# Started by support-listener for every Uptime Kuma event. On a "down" it wakes Claude
+# (headless, `claude -p`) to investigate through the support gate, then sends the owner ONE message
+# with the findings. On an "up" it sends the all-clear, unless Claude already said it was fixed.
+#
+# Claude's power here is limited by the key, not by the prompt: it can only run
+# `support-ask ...` (a fixed wrapper round `ssh support`), and the host lets that key run nothing but the support-gate menu.
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = "/opt/support-desk"
+STATE = "/var/lib/support-desk"
+LOG = "/var/log/support-desk.log"
+PROMPT = f"{HOME}/triage-prompt.md"
+
+# Kuma monitor name -> (service emoji key, name the owner knows, "down" title, "up" title,
+#                       what it means when down, where Claude should start)
+MONITORS = {
+    "AdGuard (house DNS)": ("adguard", "AdGuard", "AdGuard is down", "AdGuard is back",
+                            "Websites may not load anywhere in the house.", "container 101"),
+    "Jellyfin": ("jellyfin", "Jellyfin", "Jellyfin is down", "Jellyfin is back",
+                 "Films and TV won't play.", "container 102, service jellyfin"),
+    "Homepage dashboard": ("dashboard", "The dashboard", "The dashboard is down", "The dashboard is back",
+                           "The server dashboard won't load.", "container 103, Docker app dashboard"),
+    "Immich (photos)": ("immich", "Immich", "Immich is down", "Immich is back",
+                        "Photos won't load or back up from your phone.", "container 105, Docker apps immich_*"),
+    "Forgejo": ("forgejo", "Forgejo", "Forgejo is down", "Forgejo is back",
+                "Your code store can't be reached.", "container 107"),
+    "Home Assistant": ("homeassistant", "Home Assistant", "Home Assistant is down", "Home Assistant is back",
+                       "Smart home controls won't work.", "VM 200"),
+    "Proxmox": ("server", "The server's control panel", "The server's control panel is down",
+                "The server's control panel is back", "The Proxmox web page won't load.", "the host itself"),
+    "Hub file share": ("hub", "File sharing", "File sharing is down", "File sharing is back",
+                       "Your PC and Mac can't reach the hub.", "the host's Samba service"),
+    "Internet connection": ("internet", "The internet", "The house internet is down",
+                            "The house internet is back", "Nothing online will work.", "the house broadband"),
+    "Nightly backup ran": ("backup", "The backup", "Last night's backup didn't finish",
+                           "Backups are working again", "Your files weren't backed up last night.",
+                           "the backup log in facts"),
+}
+
+
+def log(msg):
+    with open(LOG, "a") as f:
+        f.write(f"{time.strftime('%F %T')}  triage: {msg}\n")
+
+
+def notify(level, service, title, lines, you=None):
+    cmd = ["server-notify", level, service, title] + [l for l in lines if l]
+    if you:
+        cmd += ["--you", you]
+    subprocess.run(cmd, timeout=90)
+
+
+def state_path(monitor):
+    return os.path.join(STATE, "state-" + re.sub(r"[^a-z0-9]+", "-", monitor.lower()).strip("-") + ".json")
+
+
+def load(path):
+    try:
+        return json.load(open(path))
+    except Exception:
+        return {}
+
+
+def save(path, data):
+    json.dump(data, open(path, "w"))
+
+
+def ask_claude(monitor, msg, when, hint):
+    prompt = (open(PROMPT).read().replace("{monitor}", monitor).replace("{msg}", msg or "no detail")
+              .replace("{time}", when).replace("{hint}", hint))
+    try:
+        p = subprocess.run(
+            ["claude", "-p", prompt, "--output-format", "json", "--tools", "Bash",
+             "--allowedTools", "Bash(support-ask:*)", "--permission-mode", "default"],
+            cwd=HOME, capture_output=True, text=True, timeout=540,
+            env={**os.environ, "HOME": "/root"})
+    except subprocess.TimeoutExpired:
+        return None, "timed out"
+    try:
+        out = json.loads(p.stdout)
+        text = out.get("result", "")
+        if out.get("is_error"):
+            return None, "error: " + text[:200]
+    except Exception:
+        return None, f"exit {p.returncode}: {(p.stderr or p.stdout)[-300:]}"
+    m = re.search(r"\{.*\}", text, re.S)
+    try:
+        return json.loads(m.group(0)), None
+    except Exception:
+        return None, "unreadable answer: " + text[-300:]
+
+
+def main(event_file):
+    ev = json.load(open(event_file))
+    monitor, status, msg = ev["monitor"], ev["status"], ev.get("msg", "")
+    svc, name, down_t, up_t, meaning, hint = MONITORS.get(
+        monitor, ("server", monitor, f"{monitor} is down", f"{monitor} is back",
+                  "Something on the server isn't working.", "unknown, start with facts"))
+    sp = state_path(monitor)
+    os.makedirs(STATE, exist_ok=True)
+
+    if status == 1:  # up
+        st = load(sp)
+        if st.get("investigating"):
+            st["recovered_during"] = True
+            save(sp, st)
+        elif st.get("reported") == "red":
+            mins = int((time.time() - st.get("at", time.time())) / 60)
+            notify("green", svc, up_t, ["It's working again." + (f" It was down for about {mins} minutes." if mins >= 2 else "")])
+            os.remove(sp)
+        elif os.path.exists(sp):
+            os.remove(sp)  # Claude already said it was fixed; stay quiet
+        log(f"up {monitor}")
+        return
+
+    # down: one investigation at a time, and one per outage
+    with open("/run/support-triage.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        st = load(sp)
+        # A fix Claude reported is only held for 20 minutes: if Kuma never saw the outage it
+        # never sends the "up" that would clear it, and the next real fault must not be ignored.
+        hold = 20 * 60 if st.get("reported") == "green" else 6 * 3600
+        if (st.get("reported") or st.get("investigating")) and time.time() - st.get("at", 0) < hold:
+            log(f"down {monitor} already handled")
+            return
+        started = time.time()
+        save(sp, {"investigating": True, "at": started})
+        log(f"down {monitor}: {msg}")
+        answer, err = ask_claude(monitor, msg, time.strftime("%H:%M on %d/%m"), hint)
+        st = load(sp)
+        recovered = st.get("recovered_during", False)
+
+        if answer is None:
+            log(f"claude failed for {monitor}: {err}")
+            if recovered:
+                notify("green", svc, up_t, ["It went down briefly and came back on its own."])
+                os.remove(sp)
+            else:
+                notify("red", svc, down_t, [meaning, "🤖 Claude couldn't investigate this time."],
+                       "Ask Claude on home-server to look into it.")
+                save(sp, {"reported": "red", "at": started})
+            return
+
+        log(f"claude answered for {monitor}: {json.dumps(answer)}")
+        cause, done, you = answer.get("cause", ""), answer.get("what_was_done", ""), answer.get("needs_you", "")
+        if answer.get("fixed"):
+            notify("green", svc, up_t, [cause, done], you or None)
+            if recovered:
+                os.remove(sp)
+            else:
+                save(sp, {"reported": "green", "at": started})
+        elif answer.get("recovered_on_its_own") or recovered:
+            notify("green", svc, up_t, ["It went down briefly and came back on its own.", cause], you or None)
+            os.remove(sp) if recovered else save(sp, {"reported": "green", "at": started})
+        else:
+            notify("red", svc, down_t, [answer.get("what_it_means") or meaning, cause, done],
+                   you or "Ask Claude on home-server to look into it.")
+            save(sp, {"reported": "red", "at": started})
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1])
+    except Exception as e:
+        log(f"CRASHED on {sys.argv[1:]}: {e!r}")
+        raise
+    finally:
+        try:
+            os.remove(sys.argv[1])
+        except OSError:
+            pass

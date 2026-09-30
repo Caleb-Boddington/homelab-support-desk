@@ -1,0 +1,14 @@
+[Unit]
+Description=Support desk: receives Uptime Kuma alerts and wakes Claude
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+Environment=HOME=/root
+ExecStart=/usr/bin/python3 /usr/local/bin/support-listener.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
