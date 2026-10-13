@@ -7,9 +7,21 @@
 # is refused. The menu is read-only checks plus the easy fixes the owner approved on 23/09/2026:
 # restart a crashed container, app or service. Nothing on it deletes or reconfigures.
 # Widening it needs the owner's say-so for that specific addition.
+#
+# Hardened after the security review of 28/09/2026:
+# - B7: the request is logged with newlines and other control characters made visible, so a
+#   request cannot forge an extra line in the log.
+# - B3: Claude reads app logs, and a log line can be written to steer it. Whatever it is steered
+#   into, the restart verbs below allow at most MAX_FIXES_PER_HOUR restarts an hour between them.
 set -uo pipefail
 LOG=/var/log/support-desk.log
-log() { echo "$(date '+%F %T')  $*" >> "$LOG"; }
+FIXES=/var/lib/support-gate/fixes   # one line per restart: seconds since 1970
+MAX_FIXES_PER_HOUR=4
+log() {
+  local m="$*"
+  m=${m//$'\n'/\\n}; m=${m//$'\r'/\\r}; m=${m//[[:cntrl:]]/?}
+  echo "$(date '+%F %T')  $m" >> "$LOG"
+}
 
 read -r -a A <<< "${SSH_ORIGINAL_COMMAND:-help}"
 CMD=${A[0]:-help}; X=${A[1]:-}; Y=${A[2]:-}
@@ -18,6 +30,36 @@ ct_ok()   { [[ $1 =~ ^[0-9]{3}$ ]] && pct status "$1" >/dev/null 2>&1; }
 vm_ok()   { [[ $1 =~ ^[0-9]{3}$ ]] && qm status "$1" >/dev/null 2>&1; }
 name_ok() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$ ]]; }
 refuse()  { echo "REFUSED: $*"; log "refused: ${SSH_ORIGINAL_COMMAND:-}"; exit 2; }
+# C6, security review 13/10/2026: units that power off, reboot, sleep or cut the container off
+# (ssh, network, consoles, dbus) are never restarted, and nor is any template unit (name@...).
+# A deny-list, not an allow-list: the repo does not record every service triage may need
+# (jellyfin in 102 and AdGuardHome are known; others are not), so an allow-list could break a
+# real fix. Compared in lower case with ".service" taken off.
+unit_ok() {
+  local u=${1,,}; u=${u%.service}
+  case "$u" in
+    *@*|systemd-*|*poweroff*|*reboot*|halt*|kexec*|*suspend*|*hibernate*|*sleep*|rescue*|\
+    emergency*|shutdown*|ctrl-alt-del*|ssh|sshd|ssh-*|sshd-*|network*|*getty*|dbus*|init|\
+    user-*|polkit*) return 1 ;;
+  esac
+  return 0
+}
+# Counts this restart if fewer than MAX_FIXES_PER_HOUR happened in the last hour, else refuses.
+# C7, 13/10/2026: read, count and write happen under a lock beside $FIXES, so two requests at the
+# same moment cannot both read "3" and both go ahead. The lock is let go before the restart runs.
+fix_allowed() {
+  local now recent
+  mkdir -p "${FIXES%/*}"
+  exec 9> "$FIXES.lock"
+  flock -w 30 9 || refuse "the restart count is busy, try again in a minute"
+  now=$(date +%s)
+  recent=$(awk -v now="$now" '$1 ~ /^[0-9]+$/ && $1 > now - 3600' "$FIXES" 2>/dev/null)
+  if [ -n "$recent" ] && [ "$(wc -l <<< "$recent")" -ge "$MAX_FIXES_PER_HOUR" ]; then
+    refuse "already $MAX_FIXES_PER_HOUR restarts in the last hour, leave this one for the owner"
+  fi
+  printf '%s\n' ${recent:+$recent} "$now" > "$FIXES"
+  flock -u 9; exec 9>&-
+}
 
 case "$CMD" in
 help)
@@ -29,10 +71,11 @@ Read-only:
   vm-status ID             one VM: state
   logs ID [APP]            recent warnings in a container, or one app's log (Docker or service)
   host-logs                host warnings from the last 3 hours
-Easy fixes (logged):
+Easy fixes (logged, at most 4 restarts an hour between them):
   restart-ct ID            restart a container (not 111, where the desk itself runs)
   restart-app ID NAME      restart one Docker app inside a container
-  restart-service ID UNIT  restart one service inside a container
+  restart-service ID UNIT  restart one app's service inside a container (never systemd-*, ssh,
+                           networking, dbus, getty, power or sleep units, or any name@ unit)
 EOF
   ;;
 facts)
@@ -71,10 +114,12 @@ host-logs)
 restart-ct)
   ct_ok "$X" || refuse "no such container: $X"
   [ "$X" = 111 ] && refuse "111 is where the support desk runs"
+  fix_allowed
   log "restart-ct $X"; pct reboot "$X" && sleep 20; pct status "$X" ;;
 restart-app)
   ct_ok "$X" || refuse "no such container: $X"; name_ok "$Y" || refuse "bad app name"
   [ "$X" = 111 ] && refuse "111 is where the support desk runs"
+  fix_allowed
   log "restart-app $X $Y"; pct exec "$X" -- docker restart "$Y" && sleep 15
   pct exec "$X" -- docker ps -a --filter "name=^${Y}$" --format '{{.Names}}\t{{.Status}}' ;;
 restart-service)
@@ -83,6 +128,10 @@ restart-service)
   # Only real services. Without this, poweroff.target or reboot.target would switch the
   # container off rather than restart anything (security review, 28/09/2026).
   case "$Y" in *.service) ;; *.*) refuse "services only, not $Y" ;; *) Y="$Y.service" ;; esac
+  # C6, 13/10/2026: some .service units switch the container off or cut it off when "restarted"
+  # (systemd-poweroff.service is poweroff itself), and template units (name@) can start anything.
+  unit_ok "$Y" || refuse "not a service the support desk may restart: $Y"
+  fix_allowed
   log "restart-service $X $Y"; pct exec "$X" -- systemctl restart "$Y" && sleep 10
   pct exec "$X" -- systemctl is-active "$Y" ;;
 *)

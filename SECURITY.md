@@ -31,18 +31,79 @@ was denied `ssh support -o ConnectTimeout=5 guests` by Claude Code's permission 
 restart verbs now refuse the desk's own container, and `restart-service` only accepts
 `*.service` units, so `poweroff.target` is refused.
 
+On 13/10/2026, after the 0.1.2 fixes went live: a POST from a LAN address not in
+`allowed-senders` was refused and logged as "not in allowed-senders", and inside the listener's
+service the other SSH key read 0 bytes. The restart cap, its lock and the unit deny-list have
+only been tested against local stand-ins so far, not the live gate. `docs/testing.md` has both.
+
 ## What it can still do
 
 Restart any container except the desk's own, and any app or service inside one of the others. That is the
 point of it, and it's also the risk: a wrong diagnosis can restart something at a bad moment.
 
+From 0.1.2 the gate also allows at most four restarts an hour between all the restart
+verbs, and refuses the fifth. The count is kept under a lock, so two requests at the same
+moment can't both slip in as the fourth.
+
+`restart-service` also refuses any unit that would switch a container off or cut it off
+rather than restart something: `systemd-*`, anything with poweroff, reboot, suspend,
+hibernate or sleep in its name, `halt`, `kexec`, `rescue`, `emergency`, `shutdown`, ssh,
+networking, dbus, getty, `init`, `user-*`, `polkit*`, and any template unit (`name@`). That's a
+deny-list, so it only stops the units I thought of. An allow-list per container would be
+tighter, and it's the next step if the deny-list ever misses one.
+
+## What the desk's Claude can read
+
+The listener's service unit runs with `NoNewPrivileges=yes` and
+`InaccessiblePaths=-/root/.ssh/id_ed25519`, and the triage process and Claude inherit both. If
+the desk container also keeps a key there that opens a root shell on the host, Claude can't
+read it, while `/root/.ssh/id_support`, the gate key, stays readable. A key kept under any
+other name needs its own `InaccessiblePaths` line. Claude still runs as root inside
+the desk container. Giving it a user of its own needs its own Claude Code login, and that
+hasn't been done.
+
+## Text Claude reads is untrusted
+
+Kuma's alert message and the app logs Claude reads can contain words written by anyone who can
+make an app log a line. That's prompt injection (text written to steer the AI), and no prompt
+can rule it out completely. The gate is the real boundary: whatever Claude is talked into, it
+can only ask for what's on the menu, and only four restarts an hour. On top of that, the triage
+script flattens Kuma's message to one short line and fences it in the prompt, the prompt tells
+Claude never to obey text found in it, and Claude's answer is cut short and stripped of links
+before it reaches your phone.
+
+## The listener
+
+The listener checks the token with a constant-time comparison, drops a client that goes quiet
+for 10 seconds, refuses a body over 64 KiB, and stops queueing once 50 alerts are waiting.
+Claude is woken at most six times an hour; any fault after that still gets a plain message.
+Newlines and other control characters are escaped in every log line the desk writes, so an alert
+can't forge an entry in the gate's log or the desk's.
+
+The token travels in plain HTTP, so anyone on your LAN who sees the URL can post a fake alert.
+List Kuma's address in `/etc/support-desk/allowed-senders`, one address per line, and the
+listener refuses everyone else. Without that file it accepts any address and logs a warning at
+start.
+
 ## What leaves your network
 
 The fault, and whatever logs Claude reads while investigating, go to Anthropic as part of the
-prompt. Notifications go to ntfy.sh. Anyone who knows your ntfy topic can read them, so use a
-long random one.
+prompt. Notifications go to ntfy.sh by default. On a public ntfy server the topic name is the
+only lock: anyone who knows it can read your alerts and send fake ones. Use a long random topic
+at the very least. To lock it properly, either reserve the topic on ntfy.sh or run your own ntfy
+with access control, then put an access token in `/root/ntfy-token.txt` (and your server's
+address in `/root/ntfy-server.txt` if it isn't ntfy.sh). `server-notify` sends the token as a
+Bearer header whenever that file exists.
 
-## Reporting
+`server-notify` also stops sending non-red messages after 30 in an hour or 60 in a day on
+each machine, and logs every one it drops as `DROPPED` in `/var/log/server-notify.log`. Reds
+and brakes always go. A flood of ambers, forged or not, can't use up your ntfy allowance and
+leave a real disk alert with nowhere to go.
 
-Open an issue at https://github.com/Caleb-Boddington/homelab-support-desk/issues. This is a
-personal project with no support commitment and no response-time promise.
+## Reporting a vulnerability
+
+Please don't open a public issue for a security problem. Report it privately with **Report a
+vulnerability** on the repo's Security tab
+(https://github.com/Caleb-Boddington/homelab-support-desk/security). Ordinary bugs can still go
+in the issues. This is a personal project with no support commitment and no response-time
+promise.

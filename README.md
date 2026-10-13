@@ -2,7 +2,7 @@
 
 Automated monitoring and incident response for a Proxmox home server. When something goes down, Claude investigates, applies an approved fix if there is one, and sends a single plain-English notification to my phone.
 
-![version](https://img.shields.io/badge/version-0.1.1-blueviolet)
+![version](https://img.shields.io/badge/version-0.1.2-blueviolet)
 ![licence](https://img.shields.io/badge/licence-MIT-blue)
 ![status](https://img.shields.io/badge/status-experimental-yellow)
 
@@ -23,8 +23,9 @@ The part I'd actually defend in an interview is what the AI isn't allowed to do.
 This gives an AI agent a route into your hypervisor, so be clear about what that route is.
 
 - The desk holds one SSH key. On the host, that key is pinned in `authorized_keys` with `command="/usr/local/sbin/support-gate",restrict`. Whatever the key asks to run, the host runs the gate instead. The gate reads the request and refuses anything not on its menu. No shell, no port forwarding, no chaining.
-- The menu includes restarts. A buggy or confused agent can restart one of your apps at a bad moment. It can't delete, reconfigure or reach a shell.
-- The listener takes webhooks over plain HTTP on your LAN, protected by a random token in the URL. Anyone who can read that URL on your network can wake Claude. Never expose port 8787 to the internet.
+- The menu includes restarts. A buggy or confused agent can restart one of your apps at a bad moment, up to four times an hour. It can't delete, reconfigure or reach a shell.
+- Claude reads Kuma's alert text and your apps' logs, and anyone who can make an app log a line can write words aimed at it (prompt injection). The desk fences that text and tells Claude never to obey it, but no prompt can rule it out. The gate's menu is what actually limits the damage.
+- The listener takes webhooks over plain HTTP on your LAN, protected by a random token in the URL. Anyone who can read that URL on your network can wake Claude, unless you list Kuma's address in `/etc/support-desk/allowed-senders`. Never expose port 8787 to the internet.
 - Fault details, logs included, are sent to Anthropic as part of Claude's prompt.
 
 `SECURITY.md` has the details.
@@ -79,6 +80,7 @@ install -m 755 desk/server-notify       /usr/local/bin/server-notify
 mkdir -p /opt/support-desk /etc/support-desk
 install -m 644 desk/triage-prompt.md /opt/support-desk/triage-prompt.md
 openssl rand -hex 16 > /etc/support-desk/token && chmod 600 /etc/support-desk/token
+echo "<kuma-ip>" > /etc/support-desk/allowed-senders   # only Kuma may post alerts
 echo "your-ntfy-topic" > /root/ntfy-topic.txt
 install -m 644 desk/support-listener.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now support-listener
@@ -133,7 +135,7 @@ flowchart TD
     W["support-watch.sh<br/>plain checks, no AI"] --> N
 ```
 
-`support-triage` keeps a small state file per monitor, and that is how "one problem, one message" works. A second "down" for the same outage is ignored. If Claude says it fixed something, Kuma's later "up" stays quiet. If the app came back while Claude was still looking, it says so. If Claude fails or times out, a plain red message still goes out, so a fault is never silent.
+`support-triage` keeps a small state file per monitor, and that is how "one problem, one message" works. A second "down" for the same outage is ignored. If Claude says it fixed something, Kuma's later "up" stays quiet, but the desk checks again 8 minutes on: if Kuma still hasn't seen the app come back, a red follows, so a wrong "fixed" can't hide an outage. If the app came back while Claude was still looking, it says so. If Claude fails or times out, a plain red message still goes out, so a fault is never silent.
 
 Claude has to answer in fixed JSON (`fixed`, `cause`, `what_was_done`, `needs_you`), and the script builds the message from that. Claude never writes to the phone directly.
 
@@ -155,6 +157,10 @@ These are what I'd point at in an interview, because each is a choice with a rea
 - **The ransomware brake isn't switched on.** It only logs, for the reason above.
 - **Plain HTTP on the LAN**, with a token in the URL. That's fine on a home network and wrong anywhere else.
 - **My backup script isn't included.** It's too tied to my own paths. The gate's `facts` command expects a restic log at `/var/log/backup.log`, and `smartd-ntfy.sh` starts a `backup.service` that you have to supply.
+- **Claude runs as root inside the desk container.** The service hides any other SSH key from it, but a user of its own would need its own Claude Code login, and I haven't set that up.
+- **The service check is a deny-list.** `restart-service` refuses the units I know are dangerous. A unit I didn't think of would get through.
+- **Ambers and greens can be dropped.** Past 30 in an hour or 60 in a day, `server-notify` logs them instead of sending them. Reds always go.
+- **Restarting the listener cancels a pending recheck**, so a fix reported in the 8 minutes before a restart goes unchecked.
 - **Cost per run isn't measured.**
 
 ## Credits

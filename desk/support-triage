@@ -7,6 +7,21 @@
 #
 # Claude's power here is limited by the key, not by the prompt: it can only run
 # `support-ask ...` (a fixed wrapper round `ssh support`), and the host lets that key run nothing but the support-gate menu.
+#
+# Hardened after the security review of 28/09/2026:
+# - B3: Kuma's message and the logs Claude reads can carry text written by anyone who can make an
+#   app log a line, so they are treated as untrusted. The message is flattened to one line, cut
+#   short and fenced in the prompt, and the prompt tells Claude never to obey it. Claude's answer
+#   is cleaned before it reaches the owner's phone: no links, no control characters, short fields.
+# - B4: a fake alert with a new monitor name each time would wake Claude every time, so Claude is
+#   woken at most MAX_CLAUDE_PER_HOUR times an hour. Later faults still get a plain message.
+# - B7: log lines have their control characters escaped, so a message cannot forge a log line.
+# Security review of 13/10/2026:
+# - C4: after a green that Kuma has not yet confirmed with an "up", this process waits
+#   RECHECK_AFTER and sends a red if the "up" still hasn't come (see recheck()).
+# - C7(c), left as it is on purpose: one lock for every monitor means a long run delays the
+#   others. A lock per monitor would let several Claude runs share CT 111's memory at once (the
+#   25/09/2026 thrash) and lets two investigations restart things in parallel.
 import fcntl
 import json
 import os
@@ -18,7 +33,14 @@ import time
 HOME = "/opt/support-desk"
 STATE = "/var/lib/support-desk"
 LOG = "/var/log/support-desk.log"
+LOCK = "/run/support-triage.lock"
 PROMPT = f"{HOME}/triage-prompt.md"
+MAX_CLAUDE_PER_HOUR = 6
+RECHECK_AFTER = 8 * 60   # C4: how long after a green, with no "up" from Kuma, before a red follows
+MAX_MSG, MAX_FIELD = 300, 200
+
+CONTROL = re.compile(r"[\x00-\x1f\x7f\x85  ]")
+LINK = re.compile(r"(?i)\b(?:https?://|ftp://|www\.)\S+")
 
 # Kuma monitor name -> (service emoji key, name the owner knows, "down" title, "up" title,
 #                       what it means when down, where Claude should start)
@@ -47,9 +69,46 @@ MONITORS = {
 }
 
 
+def escape(text):
+    """Control characters as visible \\xNN, so one log call is always one log line."""
+    return CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", str(text))
+
+
+def flatten(text, limit):
+    """Control characters to spaces, whitespace squeezed, cut to `limit` characters."""
+    return re.sub(r"\s+", " ", CONTROL.sub(" ", str(text))).strip()[:limit]
+
+
+def untrusted(text, limit):
+    """Text from Kuma or an app, made safe to quote inside the prompt's fence."""
+    return flatten(text, limit).replace("<", "(").replace(">", ")")
+
+
+def clean_field(text):
+    """One field of Claude's answer, made safe to put on the owner's phone."""
+    return LINK.sub("(link removed)", flatten(text if isinstance(text, str) else "", MAX_FIELD))
+
+
 def log(msg):
     with open(LOG, "a") as f:
-        f.write(f"{time.strftime('%F %T')}  triage: {msg}\n")
+        f.write(f"{time.strftime('%F %T')}  triage: {escape(msg)}\n")
+
+
+def claude_allowed():
+    """True, and the run is counted, if Claude has been woken fewer than the cap this hour."""
+    path = os.path.join(STATE, "claude-runs.json")
+    now = time.time()
+    runs = [t for t in load(path).get("runs", []) if isinstance(t, (int, float)) and now - t < 3600]
+    if len(runs) >= MAX_CLAUDE_PER_HOUR:
+        return False
+    save(path, {"runs": runs + [now]})
+    return True
+
+
+def fill_prompt(template, values):
+    """Fill {monitor}, {msg}, {time} and {hint} in one pass, so text inside one value can never
+    be taken for another placeholder."""
+    return re.sub(r"\{(monitor|msg|time|hint)\}", lambda m: values[m.group(1)], template)
 
 
 def notify(level, service, title, lines, you=None):
@@ -75,8 +134,9 @@ def save(path, data):
 
 
 def ask_claude(monitor, msg, when, hint):
-    prompt = (open(PROMPT).read().replace("{monitor}", monitor).replace("{msg}", msg or "no detail")
-              .replace("{time}", when).replace("{hint}", hint))
+    prompt = fill_prompt(open(PROMPT).read(), {
+        "monitor": untrusted(monitor, 100), "msg": untrusted(msg, MAX_MSG) or "no detail",
+        "time": when, "hint": hint})
     try:
         p = subprocess.run(
             ["claude", "-p", prompt, "--output-format", "json", "--tools", "Bash",
@@ -94,14 +154,24 @@ def ask_claude(monitor, msg, when, hint):
         return None, f"exit {p.returncode}: {(p.stderr or p.stdout)[-300:]}"
     m = re.search(r"\{.*\}", text, re.S)
     try:
-        return json.loads(m.group(0)), None
+        answer = json.loads(m.group(0))
+        if not isinstance(answer, dict):
+            raise ValueError
     except Exception:
         return None, "unreadable answer: " + text[-300:]
+    return clean_answer(answer), None
+
+
+def clean_answer(answer):
+    """Only the expected fields, with the text ones cleaned and the flags forced to booleans."""
+    out = {k: clean_field(answer.get(k)) for k in ("what_it_means", "cause", "what_was_done", "needs_you")}
+    out.update({k: answer.get(k) is True for k in ("fixed", "recovered_on_its_own")})
+    return out
 
 
 def main(event_file):
     ev = json.load(open(event_file))
-    monitor, status, msg = ev["monitor"], ev["status"], ev.get("msg", "")
+    monitor, status, msg = flatten(ev["monitor"], 100), ev["status"], flatten(ev.get("msg", ""), MAX_MSG)
     svc, name, down_t, up_t, meaning, hint = MONITORS.get(
         monitor, ("server", monitor, f"{monitor} is down", f"{monitor} is back",
                   "Something on the server isn't working.", "unknown, start with facts"))
@@ -123,7 +193,7 @@ def main(event_file):
         return
 
     # down: one investigation at a time, and one per outage
-    with open("/run/support-triage.lock", "w") as lock:
+    with open(LOCK, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         st = load(sp)
         # A fix Claude reported is only held for 20 minutes: if Kuma never saw the outage it
@@ -135,7 +205,12 @@ def main(event_file):
         started = time.time()
         save(sp, {"investigating": True, "at": started})
         log(f"down {monitor}: {msg}")
-        answer, err = ask_claude(monitor, msg, time.strftime("%H:%M on %d/%m"), hint)
+        if claude_allowed():
+            answer, err = ask_claude(monitor, msg, time.strftime("%H:%M on %d/%m"), hint)
+            why = "🤖 Claude couldn't investigate this time."
+        else:
+            answer, err = None, f"not woken: {MAX_CLAUDE_PER_HOUR} runs in the last hour already"
+            why = f"🤖 Claude has already looked at {MAX_CLAUDE_PER_HOUR} problems in the last hour, so it didn't look at this one."
         st = load(sp)
         recovered = st.get("recovered_during", False)
 
@@ -145,7 +220,7 @@ def main(event_file):
                 notify("green", svc, up_t, ["It went down briefly and came back on its own."])
                 os.remove(sp)
             else:
-                notify("red", svc, down_t, [meaning, "🤖 Claude couldn't investigate this time."],
+                notify("red", svc, down_t, [meaning, why],
                        "Ask Claude on home-server to look into it.")
                 save(sp, {"reported": "red", "at": started})
             return
@@ -158,23 +233,67 @@ def main(event_file):
                 os.remove(sp)
             else:
                 save(sp, {"reported": "green", "at": started})
+                return (monitor, svc, down_t, meaning, started, "Claude thought it had fixed this")
         elif answer.get("recovered_on_its_own") or recovered:
             notify("green", svc, up_t, ["It went down briefly and came back on its own.", cause], you or None)
-            os.remove(sp) if recovered else save(sp, {"reported": "green", "at": started})
+            if recovered:
+                os.remove(sp)
+            else:
+                save(sp, {"reported": "green", "at": started})
+                return (monitor, svc, down_t, meaning, started, "Claude thought this had come back on its own")
         else:
             notify("red", svc, down_t, [answer.get("what_it_means") or meaning, cause, done],
                    you or "Ask Claude on home-server to look into it.")
             save(sp, {"reported": "red", "at": started})
 
 
-if __name__ == "__main__":
+def wait(seconds):
+    time.sleep(seconds)
+
+
+def recheck(monitor, svc, down_t, meaning, started, thought):
+    """C4, security review 13/10/2026. A green sent before Kuma has seen the service come back
+    makes the later "up" silent. Kuma sends one "down" per outage, so if Claude was wrong the
+    outage would stay silent for good. Kuma's "up" deletes the state file; if, RECHECK_AFTER later,
+    the file still holds this same green, Kuma has not seen it come back, so send a red. Saving the
+    red first means the eventual "up" sends the normal all-clear."""
+    wait(RECHECK_AFTER)
+    sp = state_path(monitor)
+    st = load(sp)
+    if st.get("reported") != "green" or st.get("at") != started:
+        log(f"recheck {monitor}: back up, or handled since")
+        return
+    save(sp, {"reported": "red", "at": started})
+    mins = RECHECK_AFTER // 60
+    log(f"recheck {monitor}: no up from Kuma {mins} minutes after a green, sending red")
+    notify("red", svc, down_t, [f"🤖 {thought}, but it's still down: Uptime Kuma hasn't seen it come "
+                                f"back in the {mins} minutes since.", meaning],
+           "Ask Claude on home-server to look into it.")
+
+
+def run(event_file):
+    """One event. The event file is removed before any recheck wait, so a waiting recheck does not
+    count against the listener's limit of events waiting for triage. The wait runs in this process
+    (the listener starts one per event and never waits for it), after the lock is let go, so it
+    holds up nothing else."""
+    pending = None
     try:
-        main(sys.argv[1])
+        pending = main(event_file)
     except Exception as e:
-        log(f"CRASHED on {sys.argv[1:]}: {e!r}")
+        log(f"CRASHED on {event_file}: {e!r}")
         raise
     finally:
         try:
-            os.remove(sys.argv[1])
+            os.remove(event_file)
         except OSError:
             pass
+    if pending:
+        try:
+            recheck(*pending)
+        except Exception as e:
+            log(f"CRASHED rechecking {pending[0]}: {e!r}")
+            raise
+
+
+if __name__ == "__main__":
+    run(sys.argv[1])

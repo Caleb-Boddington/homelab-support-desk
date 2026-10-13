@@ -9,6 +9,14 @@ Environment=HOME=/root
 ExecStart=/usr/bin/python3 /usr/local/bin/support-listener.py
 Restart=always
 RestartSec=5
+# Security review C1, 13/10/2026: the Claude this starts must never reach the host's root key
+# (ssh pve), if the desk holds one. Only /root/.ssh/id_support, the gate-only key, stays
+# readable. Tested in CT 111 with systemd-run: the other key reads 0 bytes inside and claude -p
+# still answers. A real non-root user needs its own login (claude setup-token). The leading -
+# skips a path your desk doesn't have, rather than failing the start.
+InaccessiblePaths=-/root/.ssh/id_ed25519
+# ReadOnlyPaths=-/path/to/files/the/desk/may/read/but/never/change
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target

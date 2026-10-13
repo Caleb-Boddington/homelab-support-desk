@@ -7,13 +7,88 @@
 # LEVEL is red, amber, green or brake. SERVICE picks the emoji at the end of the title.
 # Style chosen by the owner on 23/09/2026: traffic light first, service emoji last, a blank line
 # between every section. If everything is fine, nothing is sent at all.
+#
+# B6, security review of 28/09/2026: on a public ntfy server the topic name is the only lock, and
+# anyone who learns it can read the alerts and send fake ones. Two optional files close that:
+#   /root/ntfy-token.txt   an ntfy access token, sent as "Authorization: Bearer ..."
+#   /root/ntfy-server.txt  the ntfy server to post to, for a self-hosted one (default ntfy.sh)
+# The token only helps once the topic is locked on the server side (reserved on ntfy.sh, or
+# deny-all with a user on a self-hosted ntfy). Without the files it works exactly as before.
+#
+# C5, security review of 13/10/2026: a safety valve. Free ntfy.sh allows a limited number of
+# messages a day (250 by third-party accounts, not checked on ntfy.sh), and a flood of ambers
+# from anything (a looping check, a flapping service) would use that up, so the
+# next real disk or outage alert would fail. So: past MAX_PER_HOUR non-red messages in the last
+# hour, or MAX_PER_DAY in the last 24 hours, non-red ones are dropped and logged. Red and brake
+# always go and are never counted. The count is per machine (the host and each container keep
+# their own) in RATE_FILE; if that file is missing, unreadable or corrupt, the message is sent.
 import json
+import os
+import re
 import sys
 import time
 import urllib.request
 
+try:
+    import fcntl
+except ImportError:  # only on Windows, where the tests run
+    fcntl = None
+
 TOPIC_FILE = "/root/ntfy-topic.txt"
+TOKEN_FILE = "/root/ntfy-token.txt"
+SERVER_FILE = "/root/ntfy-server.txt"
+DEFAULT_SERVER = "https://ntfy.sh/"
 LOG = "/var/log/server-notify.log"
+RATE_FILE = "/var/lib/server-notify/recent"   # one line per non-red message sent: seconds since 1970
+MAX_PER_HOUR, MAX_PER_DAY = 30, 60
+ALWAYS = ("red", "brake")
+
+
+def write_log(status, title):
+    try:
+        with open(LOG, "a") as f:
+            # Control characters escaped, so a title can never forge a second log line (B7).
+            title = re.sub(r"[\x00-\x1f\x7f\x85  ]", lambda m: f"\\x{ord(m.group()):02x}", title)
+            f.write(f"{time.strftime('%F %T')}  {status}  {title}\n")
+    except OSError:
+        pass
+
+
+def within_limits(level):
+    """True if this message may go, and then it is counted. Red and brake always go."""
+    if level in ALWAYS:
+        return True
+    now = time.time()
+    try:
+        os.makedirs(os.path.dirname(RATE_FILE), exist_ok=True)
+        with open(RATE_FILE, "a+", encoding="utf-8", errors="replace") as f:
+            if fcntl:
+                fcntl.flock(f, fcntl.LOCK_EX)   # two senders at once must not both take the last place
+            f.seek(0)
+            times = []
+            for word in f.read().split():
+                try:
+                    t = float(word)
+                except ValueError:
+                    continue   # a corrupt line costs nothing but itself
+                if 0 <= now - t < 86400:
+                    times.append(t)
+            ok = sum(1 for t in times if now - t < 3600) < MAX_PER_HOUR and len(times) < MAX_PER_DAY
+            if ok:
+                times.append(now)
+            f.seek(0)
+            f.truncate()
+            f.write("".join(f"{int(t)}\n" for t in times))
+            return ok
+    except Exception:
+        return True   # can't keep count: better a message too many than a real alert lost
+
+
+def read_optional(path):
+    try:
+        return open(path).read().strip() or None
+    except OSError:
+        return None
 
 LIGHTS = {"red": ("🔴", 4), "amber": ("🟠", 3), "green": ("🟢", 3), "brake": ("🛑", 5)}
 
@@ -46,27 +121,30 @@ def main(argv):
         "message": "\n\n".join(lines) or title,
         "priority": priority,
     }
+    if not within_limits(level):
+        write_log(f"DROPPED (over {MAX_PER_HOUR} an hour or {MAX_PER_DAY} a day that aren't red)", body["title"])
+        return 0
     try:
         body["topic"] = open(TOPIC_FILE).read().strip()
     except OSError:
         return 1
     data = json.dumps(body).encode()
+    server = (read_optional(SERVER_FILE) or DEFAULT_SERVER).rstrip("/") + "/"
+    headers = {"Content-Type": "application/json"}
+    token = read_optional(TOKEN_FILE)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     ok = False
     for attempt in range(3):
         try:
-            req = urllib.request.Request("https://ntfy.sh/", data=data,
-                                         headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(server, data=data, headers=headers)
             ok = urllib.request.urlopen(req, timeout=10).status == 200
             if ok:
                 break
         except Exception:
             pass
         time.sleep(5 * (attempt + 1))
-    try:
-        with open(LOG, "a") as f:
-            f.write(f"{time.strftime('%F %T')}  {'sent' if ok else 'FAILED'}  {body['title']}\n")
-    except OSError:
-        pass
+    write_log("sent" if ok else "FAILED", body["title"])
     return 0 if ok else 1
 
 
