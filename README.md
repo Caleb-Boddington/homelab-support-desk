@@ -6,7 +6,7 @@ Automated monitoring and incident response for a Proxmox home server. When somet
 ![licence](https://img.shields.io/badge/licence-MIT-blue)
 ![status](https://img.shields.io/badge/status-experimental-yellow)
 
-It's been running on my own server since 23/09/2026. On that day I stopped one of my apps (Forgejo, a self-hosted code store) on purpose. Uptime Kuma saw it go down at 22:26:44, Claude restarted it and checked it was back, and the notification went out at 22:27:59. That was about 75 seconds, with nobody touching a keyboard. That's one real test on one server, so treat it as experimental.
+It's been running on my own server since 23/09/2026. On that day one of my apps (Forgejo, a self-hosted code store) was stopped on purpose. Uptime Kuma saw it go down at 22:26:44, Claude restarted it and checked it was back, and the notification went out at 22:27:59. That was about 75 seconds, with nobody touching a keyboard. That's one real test on one server, so treat it as experimental.
 
 The part I'd actually defend in an interview is what the AI isn't allowed to do. Its permissions are limited by an SSH key, not by instructions in a prompt.
 
